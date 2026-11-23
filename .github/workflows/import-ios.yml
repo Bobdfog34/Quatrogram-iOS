@@ -1,0 +1,54 @@
+name: Import Quatrogram iOS source
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: quatrogram-ios-import
+  cancel-in-progress: false
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      UPSTREAM_REPO: https://github.com/iamxvbaba/gramsrv-Telegram-iOS.git
+      APP_DISPLAY_NAME: Quatrogram
+      LINK_DOMAIN: quatrogram.net
+    steps:
+      - name: Checkout repository config
+        uses: actions/checkout@v4
+        with:
+          path: config
+          fetch-depth: 1
+
+      - name: Clone patched iOS source with submodules
+        run: |
+          git clone --depth 1 -b master "$UPSTREAM_REPO" src
+          cd src
+          echo "Upstream HEAD: $(git rev-parse HEAD)"
+          # The upstream .gitmodules points to a private/missing rlottie fork.
+          sed -i 's#url=../rlottie.git#url=https://github.com/TelegramMessenger/rlottie.git#' .gitmodules
+          git submodule sync --recursive
+          git submodule update --init --recursive --depth 1
+
+      - name: Apply Quatrogram branding
+        run: python3 config/.github/scripts/finalize_ios.py
+
+      - name: Restore repository config files
+        run: |
+          cp -R config/.github src/.github
+          cp config/README.md src/README.md
+
+      - name: Commit and push source to master
+        run: |
+          cd src
+          git add -A
+          git checkout --orphan quatrogram-ios-release
+          git add -A
+          git -c user.name="quatrogram-bot" -c user.email="quatrogram-bot@users.noreply.github.com" \
+            commit -m "Quatrogram 13.3.1 iOS source for gramsrv"
+          git push --force "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:master

@@ -1,0 +1,113 @@
+name: Build Quatrogram IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: quatrogram-ios-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 420
+    env:
+      SOURCE_DIR: /Users/Shared/quatrogram-ios
+      BAZEL_USER_ROOT: /private/var/tmp/_bazel_quatrogram
+      TAG: v13.3.1-ios
+      ASSET: Quatrogram-13.3.1.ipa
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Init submodules with corrected rlottie URL
+        shell: bash
+        run: |
+          sed -i 's#url=../rlottie.git#url=https://github.com/TelegramMessenger/rlottie.git#' .gitmodules
+          git submodule sync --recursive
+          git submodule update --init --recursive --depth 1
+
+      - name: Select Xcode
+        shell: bash
+        run: |
+          XCODE_VERSION=$(python3 -c 'import json;print(json.load(open("versions.json"))["xcode"])')
+          if [ -d "/Applications/Xcode_${XCODE_VERSION}.app" ]; then
+            sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
+          else
+            echo "Xcode ${XCODE_VERSION} not found; using runner default with --overrideXcodeVersion"
+          fi
+
+      - name: Create canonical source directory
+        shell: bash
+        run: |
+          mkdir -p /Users/Shared
+          rm -rf "$SOURCE_DIR"
+          cp -R "$GITHUB_WORKSPACE" "$SOURCE_DIR"
+
+      - name: Build unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SOURCE_DIR"
+
+          export APP_VERSION=$(python3 -c 'import json;print(json.load(open("versions.json"))["app"])')
+          BUILD_NUMBER=$(git rev-list --count HEAD)
+          export BUILD_NUMBER
+          echo "APP_VERSION=$APP_VERSION BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+
+          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+
+          python3 -u build-system/Make/Make.py \
+            --overrideXcodeVersion \
+            --bazelUserRoot="$BAZEL_USER_ROOT" \
+            build \
+            --configurationPath="build-system/appstore-configuration.json" \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --configuration=release_arm64 \
+            --buildNumber="$BUILD_NUMBER"
+
+          mkdir -p build/artifacts
+          found=0
+          for f in bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/Telegram.ipa; do
+            if [ -f "$f" ]; then
+              cp "$f" "build/artifacts/$ASSET"
+              found=1
+            fi
+          done
+          if [ "$found" -ne 1 ]; then
+            echo "IPA not found"
+            exit 1
+          fi
+          ls -lh "build/artifacts/$ASSET"
+          shasum -a 256 "build/artifacts/$ASSET" | tee build/artifacts/Quatrogram-13.3.1.ipa.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Quatrogram-IPA
+          path: /Users/Shared/quatrogram-ios/build/artifacts/Quatrogram-13.3.1.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd "$SOURCE_DIR"
+          IPA="build/artifacts/$ASSET"
+          SHA=$(cut -d' ' -f1 build/artifacts/Quatrogram-13.3.1.ipa.sha256)
+          NOTES="Quatrogram $APP_VERSION for iOS (build $BUILD_NUMBER). Unsigned IPA — sign locally before installing. SHA256: $SHA"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$IPA" --clobber
+          else
+            gh release create "$TAG" "$IPA" --title "Quatrogram $APP_VERSION (iOS)" --notes "$NOTES"
+          fi
+          echo "DIRECT_LINK=https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${ASSET}" >> "$GITHUB_ENV"
+          gh release view "$TAG" --json assets --jq '.assets[] | [.name, .browserDownloadUrl] | @tsv'
